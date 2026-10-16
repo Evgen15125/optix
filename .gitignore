@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+
+# Логи и отчёты Optix
+optix_errors.log
+scheduler_log.txt
+monitor_report_*.txt
+Optix_*.txt
+Optix_*.csv
+Optix_*.json
+Optix_*.md
+Optix_*.html
+Optix_*.pdf
+Optix_*.zip
+
+# Данные программы
+disclaimer_accepted.json
+last_update_check.json
+clean_history.json
+temp_history.json
+benchmark_history.json
+scheduler.json
+optix_tasks.json
+task_history.json
+autostart_backup.json
+autostart_disabled.json
+tweaks_backup.json
+services_backup.json
+secure_delete.json
+context_menu_disabled.json
+cookies_keep.json
+exclusions.json
+task_templates.json
+scripts_library.json
+driver_history.json
+profiles.json
+game_mode.json
+
+# Рабочие папки
+backup_deleted/
+disk_snapshots/
+diagnostics_reports/
+driver_downloads/
+install_watch/
+startup_backup/
+uninstall_backup/
+cm_backup/
+scripts/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store
