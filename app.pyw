@@ -689,6 +689,20 @@ def _load_settings():
     try:
         with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
+    except FileNotFoundError:
+        return # Первый запуск, файла еще нет
+    except Exception as e:
+        log_error("_load_settings: файл поврежден", e)
+        # Делаем бэкап поврежденного файла
+        try:
+            bad_path = SETTINGS_PATH + ".bad"
+            shutil.copy2(SETTINGS_PATH, bad_path)
+            log_error("_load_settings", Exception(f"Копия поврежденного файла сохранена в {bad_path}"))
+        except Exception:
+            pass
+        return
+
+    try:
         _STATE["auto_clean_browser"] = bool(data.get("auto_clean_browser", False))
         _STATE["current_profile"] = data.get("current_profile", "custom")
         _STATE["minimize_to_tray"] = bool(data.get("minimize_to_tray", True))
@@ -1960,6 +1974,7 @@ class CTkToolTip:
         self.widget.bind("<Enter>", self.schedule, add="+")
         self.widget.bind("<Leave>", self.hide, add="+")
         self.widget.bind("<ButtonPress>", self.hide, add="+")
+        self.widget.bind("<MouseWheel>", self.hide, add="+")
 
     def schedule(self, event=None):
         if not getattr(self, "active", True):
@@ -1974,6 +1989,10 @@ class CTkToolTip:
 
     def show(self, event=None):
         if not getattr(self, "active", True) or self.tooltip_window:
+            return
+            
+        # Проверка, что виджет ещё существует
+        if not self.widget.winfo_exists():
             return
             
         x = self.widget.winfo_rootx() + 20
@@ -2028,8 +2047,7 @@ class _OptixButton(_original_ctk_button):
             try:
                 txt = self.cget("text")
                 if txt and 0 < len(txt) < 40:
-                    # Убираем эмодзи и лишние символы
-                    import re
+                    # Убираем эмодзи и лишние символы (используем глобальный re)
                     clean_txt = re.sub(r'[^\w\s\-\.,:;!?()]', '', txt).strip()
                     if clean_txt and len(clean_txt) > 2:
                         tooltip_text = clean_txt
@@ -2182,28 +2200,25 @@ def scan_all():
     total_cats = len(CATEGORIES)
     
     for idx, cat in enumerate(CATEGORIES):
-        rows[cat["name"]]["size"].configure(text="сканируется...", text_color="#FFD54F")
-        app.update()
+        app.after(0, lambda n=cat["name"]: rows[n]["size"].configure(text="сканируется...", text_color="#FFD54F") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
+        
         size = category_size(cat)
         sizes[cat["name"]] = size
         
         if size < 0:
-            rows[cat["name"]]["size"].configure(text="не найдено", text_color="#90A4AE")
+            app.after(0, lambda n=cat["name"]: rows[n]["size"].configure(text="не найдено", text_color="#90A4AE") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
         elif size == 0:
-            rows[cat["name"]]["size"].configure(text="пусто", text_color="#90A4AE")
+            app.after(0, lambda n=cat["name"]: rows[n]["size"].configure(text="пусто", text_color="#90A4AE") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
         else:
-            if size > 1024 * 1024 * 1024: 
-                size_color = "#FF8A8A"
-            elif size > 100 * 1024 * 1024: 
-                size_color = "#FFD54F" 
-            else:
-                size_color = "#4FC3F7" 
-                
-            # Плавное появление размера
-            rows[cat["name"]]["size"].configure(text=human_size(size), text_color="#546E7A")
-            def _fade_in(label=rows[cat["name"]]["size"], final_color=size_color):
-                if label.winfo_exists():
-                    label.configure(text_color=final_color)
+            if size > 1024 * 1024 * 1024: size_color = "#FF8A8A"
+            elif size > 100 * 1024 * 1024: size_color = "#FFD54F" 
+            else: size_color = "#4FC3F7" 
+            
+            app.after(0, lambda n=cat["name"], s=human_size(size): rows[n]["size"].configure(text=s, text_color="#546E7A") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
+            
+            def _fade_in(n=cat["name"], c=size_color):
+                if rows.get(n) and rows[n]["size"].winfo_exists():
+                    rows[n]["size"].configure(text_color=c)
             app.after(300, _fade_in)
             
             total_all += size
@@ -2214,11 +2229,12 @@ def scan_all():
         elapsed = max(0.1, time.time() - t0)
         eta = (elapsed / (idx + 1)) * (total_cats - (idx + 1))
         
-        def _update_ui(p, e):
-            _animate_bar(widgets["scan_progress"], widgets["scan_progress"].get(), p, duration=200)
-            widgets["eta_label"].configure(text=f"Осталось: {int(e)} сек")
-        app.after(0, _update_ui, progress, eta)
-        app.update()
+        def _update_ui(p=progress, e=eta):
+            if widgets.get("scan_progress") and widgets["scan_progress"].winfo_exists():
+                _animate_bar(widgets["scan_progress"], widgets["scan_progress"].get(), p, duration=200)
+            if widgets.get("eta_label") and widgets["eta_label"].winfo_exists():
+                widgets["eta_label"].configure(text=f"Осталось: {int(e)} сек")
+        app.after(0, _update_ui)
         
     _clean_state["last_scan_sizes"] = sizes
     _clean_state["scan_files"] = total_files_scanned
@@ -2229,17 +2245,11 @@ def scan_all():
         _stop_pulse(widgets["scan_progress"])
         _animate_bar(widgets["scan_progress"], widgets["scan_progress"].get(), 1.0, duration=300)
         
-        if total_all > 5 * 1024 * 1024 * 1024: 
-            total_color = "#FF8A8A"
-        elif total_all > 1 * 1024 * 1024 * 1024: 
-            total_color = "#FFD54F"
-        else:
-            total_color = "#7CFC7C"
+        if total_all > 5 * 1024 * 1024 * 1024: total_color = "#FF8A8A"
+        elif total_all > 1 * 1024 * 1024 * 1024: total_color = "#FFD54F"
+        else: total_color = "#7CFC7C"
             
-        widgets["total_label"].configure(
-            text=f"Всего можно освободить: {human_size(total_all)}   •   "
-                 f"{total_files_scanned} файлов за {elapsed:.1f} сек ({speed:.0f} файлов/сек)",
-            text_color=total_color)
+        widgets["total_label"].configure(text=f"Всего можно освободить: {human_size(total_all)}   •   {total_files_scanned} файлов за {elapsed:.1f} сек ({speed:.0f} файлов/сек)", text_color=total_color)
         widgets["scan_button"].configure(state="normal", text="🔍 Сканировать снова")
         widgets["clean_button"].configure(state="normal")
         
@@ -2323,12 +2333,11 @@ def do_clean_worker(selected):
     dry = DRY_RUN.get("enabled", False)
     total_cats = len(selected)
     
-    # Запускаем "дыхание" прогресс-бара
-    _start_pulse(widgets["scan_progress"], "#4FC3F7")
+    app.after(0, lambda: _start_pulse(widgets["scan_progress"], "#4FC3F7"))
     
     for idx, cat in enumerate(selected):
-        rows[cat["name"]]["size"].configure(text="чищу...", text_color="#FFD54F")
-        app.update()
+        app.after(0, lambda n=cat["name"]: rows[n]["size"].configure(text="чищу...", text_color="#FFD54F") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
+        
         try:
             freed, files_del, errors = clean_category(cat)
         except Exception as e:
@@ -2338,13 +2347,13 @@ def do_clean_worker(selected):
         total_files += files_del
         
         if freed > 0:
-            rows[cat["name"]]["size"].configure(text=f"−{human_size(freed)}", text_color="#4FC3F7")
+            app.after(0, lambda n=cat["name"], f_=human_size(freed): rows[n]["size"].configure(text=f"−{f_}", text_color="#4FC3F7") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
             report_lines.append(f"✓ {cat['name']}: −{human_size(freed)}, файлов: {files_del}")
         elif files_del > 0:
-            rows[cat["name"]]["size"].configure(text=f"−{files_del} шт.", text_color="#4FC3F7")
+            app.after(0, lambda n=cat["name"], fd=files_del: rows[n]["size"].configure(text=f"−{fd} шт.", text_color="#4FC3F7") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
             report_lines.append(f"✓ {cat['name']}: удалено {files_del} шт.")
         else:
-            rows[cat["name"]]["size"].configure(text="0 Б", text_color="#90A4AE")
+            app.after(0, lambda n=cat["name"]: rows[n]["size"].configure(text="0 Б", text_color="#90A4AE") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
         if errors > 0:
             report_lines.append(f"    ⚠ пропущено: {errors}")
             
@@ -2352,11 +2361,10 @@ def do_clean_worker(selected):
         elapsed = max(0.1, time.time() - t0)
         eta = (elapsed / (idx + 1)) * (total_cats - (idx + 1))
         
-        def _update_ui(p, e, f_sum):
+        def _update_ui(p=progress, e=eta, f_sum=total_freed):
             _animate_bar(widgets["scan_progress"], widgets["scan_progress"].get(), p, duration=200)
             widgets["eta_label"].configure(text=f"Очистка... Осталось: {int(e)} сек (Освобождено: {human_size(f_sum)})")
-        app.after(0, _update_ui, progress, eta, total_freed)
-        app.update()
+        app.after(0, _update_ui)
         
     elapsed = time.time() - t0
     label = "Симуляция" if dry else "Освобождено"
@@ -2365,10 +2373,7 @@ def do_clean_worker(selected):
         _stop_pulse(widgets["scan_progress"])
         _animate_bar(widgets["scan_progress"], widgets["scan_progress"].get(), 1.0, duration=300)
         widgets["eta_label"].configure(text="Готово")
-        widgets["total_label"].configure(
-            text=f"{label}: {human_size(total_freed)}   •   "
-                 f"Файлов: {total_files}   •   Время: {elapsed:.1f} сек",
-            text_color="#7CFC7C")
+        widgets["total_label"].configure(text=f"{label}: {human_size(total_freed)}   •   Файлов: {total_files}   •   Время: {elapsed:.1f} сек", text_color="#7CFC7C")
         widgets["clean_button"].configure(state="normal", text="🧹 Очистить выбранное")
         widgets["scan_button"].configure(state="normal", text="🔍 Сканировать снова")
         
@@ -2388,23 +2393,15 @@ def do_clean_worker(selected):
     if not CLI_SILENT:
         try:
             prefix = "Симуляция" if dry else "Очистка"
-            show_toast(f"Optix — {prefix} завершена",
-                       f"{'Можно освободить' if dry else 'Освобождено'}: "
-                       f"{human_size(total_freed)} ({total_files} файлов)")
+            show_toast(f"Optix — {prefix} завершена", f"{'Можно освободить' if dry else 'Освобождено'}: {human_size(total_freed)} ({total_files} файлов)")
         except Exception:
             pass
     summary = "\n".join(report_lines)
-    if len(summary) > 2000:
-        summary = summary[:2000] + "\n... (сокращено)"
+    if len(summary) > 2000: summary = summary[:2000] + "\n... (сокращено)"
     if not CLI_SILENT:
         title = "🧪 Симуляция завершена" if dry else "Очистка завершена"
         prefix = "Можно освободить" if dry else "Освобождено"
-        app.after(0, lambda: messagebox.showinfo(
-            title,
-            f"{prefix}: {human_size(total_freed)}\n"
-            f"Файлов: {total_files}\n"
-            f"Время: {elapsed:.1f} сек\n\n{summary}"
-        ))
+        app.after(0, lambda: messagebox.showinfo(title, f"{prefix}: {human_size(total_freed)}\nФайлов: {total_files}\nВремя: {elapsed:.1f} сек\n\n{summary}"))
 
 
 def clean_selected():
@@ -2436,12 +2433,7 @@ def clean_selected():
 
 
 def clean_everything():
-    if not messagebox.askyesno(
-        "⚡ Очистить всё",
-        "Будут очищены ВСЕ безопасные категории.\n\n"
-        "⚠️ Корзина, кэш Steam и старые драйверы затронуты НЕ будут.\n\n"
-        "Продолжить?"
-    ):
+    if not messagebox.askyesno("⚡ Очистить всё", "Будут очищены ВСЕ безопасные категории.\n\n⚠️ Корзина, кэш Steam и старые драйверы затронуты НЕ будут.\n\nПродолжить?"):
         return
     widgets["scan_button"].configure(state="disabled")
     widgets["clean_button"].configure(state="disabled")
@@ -2449,21 +2441,20 @@ def clean_everything():
 
     def worker():
         for cat in CATEGORIES:
-            rows[cat["name"]]["size"].configure(text="сканируется...", text_color="#FFD54F")
-            app.update()
+            app.after(0, lambda n=cat["name"]: rows[n]["size"].configure(text="сканируется...", text_color="#FFD54F") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
+            
             size = category_size(cat)
             _clean_state["last_scan_sizes"][cat["name"]] = size
+            
             if size < 0:
-                rows[cat["name"]]["size"].configure(text="не найдено", text_color="#90A4AE")
+                app.after(0, lambda n=cat["name"]: rows[n]["size"].configure(text="не найдено", text_color="#90A4AE") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
             elif size == 0:
-                rows[cat["name"]]["size"].configure(text="пусто", text_color="#90A4AE")
+                app.after(0, lambda n=cat["name"]: rows[n]["size"].configure(text="пусто", text_color="#90A4AE") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
             else:
-                rows[cat["name"]]["size"].configure(text=human_size(size),
-                                                     text_color="#4FC3F7")
-            app.update()
+                app.after(0, lambda n=cat["name"], s=human_size(size): rows[n]["size"].configure(text=s, text_color="#4FC3F7") if rows.get(n) and rows[n]["size"].winfo_exists() else None)
+        
         safe = [cat for cat in CATEGORIES if cat["group"] != "warn"]
-        app.after(0, lambda: widgets["total_label"].configure(
-            text="Шаг 2/2: очистка...", text_color="#FFD54F"))
+        app.after(0, lambda: widgets["total_label"].configure(text="Шаг 2/2: очистка...", text_color="#FFD54F"))
         do_clean_worker(safe)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -4847,12 +4838,17 @@ def get_cached_temperatures():
     return {"cpu": _TEMP_CACHE["cpu"], "gpu": _TEMP_CACHE["gpu"]}
 
 def _temp_cache_worker():
+    global _TEMP_CACHE
     while True:
         try:
             temps = _get_temperatures()
-            _TEMP_CACHE["cpu"] = temps.get("cpu")
-            _TEMP_CACHE["gpu"] = temps.get("gpu")
-            _TEMP_CACHE["timestamp"] = time.time()
+            # Атомарная замена всего словаря целиком
+            new_cache = {
+                "cpu": temps.get("cpu"),
+                "gpu": temps.get("gpu"),
+                "timestamp": time.time()
+            }
+            _TEMP_CACHE = new_cache
         except Exception:
             pass
         time.sleep(10)
@@ -10531,10 +10527,18 @@ def apply_transparency_on():
 def apply_network_optimize():
     results = []
     try:
-        r = subprocess.run(["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"], capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW)
+        r = subprocess.run(
+            ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=CREATE_NO_WINDOW
+        )
         results.append("autotuning" if r.returncode == 0 else "autotuning FAIL")
         
-        r = subprocess.run(["netsh", "int", "tcp", "set", "global", "rss=enabled"], capture_output=True, text=True, timeout=15, creationflags=CREATE_NO_WINDOW)
+        r = subprocess.run(
+            ["netsh", "int", "tcp", "set", "global", "rss=enabled"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=CREATE_NO_WINDOW
+        )
         results.append("rss" if r.returncode == 0 else "rss FAIL")
 
         ok1, _ = set_reg(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters", "TcpAckFrequency", 1, winreg.REG_DWORD)
@@ -10548,6 +10552,18 @@ def apply_network_optimize():
         show_toast("Optix — оптимизация сети", "TCP-параметры применены. Перезагрузите ПК.")
     except Exception as e:
         log_error("apply_network_optimize", e)
+        _safe_tweak_update("network_status", f"Ошибка: {e}", "#FF8A8A")
+
+def rollback_network_optimize():
+    try:
+        subprocess.run(
+            ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=CREATE_NO_WINDOW
+        )
+        _safe_tweak_update("network_status", "🌐 Сброшено на стандарт", "#4FC3F7")
+    except Exception as e:
+        log_error("rollback_network_optimize", e)
         _safe_tweak_update("network_status", f"Ошибка: {e}", "#FF8A8A")
 
 def apply_memory_optimize():
@@ -21067,7 +21083,7 @@ class UnbufferedFile:
                                     ctypes.byref(w), None):
                 raise OSError(f"WriteFile: {ctypes.get_last_error()}")
 
-BENCH_PATH = os.path.join(BASE_DIR, "benchmark_history.json")
+# BENCH_PATH уже определён в начале файла
 
 # Эталоны: значение, при котором тест даёт 1000 баллов.
 # Выше 1000 — лучше эталона, ниже — хуже.
@@ -25752,7 +25768,16 @@ def load_optix_tasks():
         with open(OPTIX_TASKS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         return data.get("tasks", []) if isinstance(data, dict) else []
-    except Exception:
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log_error("load_optix_tasks: файл поврежден", e)
+        try:
+            bad_path = OPTIX_TASKS_PATH + ".bad"
+            shutil.copy2(OPTIX_TASKS_PATH, bad_path)
+            log_error("load_optix_tasks", Exception(f"Копия сохранена в {bad_path}"))
+        except Exception:
+            pass
         return []
 
 
@@ -32253,7 +32278,16 @@ def load_clean_profiles():
             return {"custom": []}
         data.setdefault("custom", [])
         return data
-    except Exception:
+    except FileNotFoundError:
+        return {"custom": []}
+    except Exception as e:
+        log_error("load_clean_profiles: файл поврежден", e)
+        try:
+            bad_path = PROFILES_PATH + ".bad"
+            shutil.copy2(PROFILES_PATH, bad_path)
+            log_error("load_clean_profiles", Exception(f"Копия сохранена в {bad_path}"))
+        except Exception:
+            pass
         return {"custom": []}
 
 
@@ -33331,9 +33365,11 @@ def _net_wifi_scan(status_lbl, result_box, btn):
             cur_ssid = None
             for line in lines:
                 line = line.strip()
-                if line.startswith("SSID") and "BSSID" not in line:
+                low_line = line.lower()
+                # Проверяем и английские, и русские названия ключей
+                if (low_line.startswith("ssid") or low_line.startswith("имя сети")) and "bssid" not in low_line:
                     cur_ssid = line.split(":", 1)[-1].strip()
-                elif "Signal" in line and cur_ssid:
+                elif ("signal" in low_line or "сигнал" in low_line) and cur_ssid:
                     sig = line.split(":", 1)[-1].strip()
                     networks.append(f"📶 {cur_ssid[:30]:<30} | Уровень: {sig}")
                     cur_ssid = None
@@ -33978,15 +34014,30 @@ def build_assistant_page(parent):
         # Если ключа нет, показываем справку
         add_bot_message("Извини, я пока не умею отвечать на такие вопросы.\n\nПопробуй: «очисти», «температура», «диск» или «диагностика».\n\n💡 Чтобы я стал умнее, добавь API-ключ DeepSeek в Настройках.")
 
+    state = {"busy": False}
+
     def send_msg(event=None):
+        if state["busy"]:
+            return
         query = entry.get().strip()
         if not query:
             return
         entry.delete(0, "end")
         add_user_message(query)
         
+        state["busy"] = True
+        entry.configure(state="disabled")
+        btn_send.configure(state="disabled")
+        
+        def run_and_unlock():
+            process_command(query)
+            state["busy"] = False
+            entry.configure(state="normal")
+            btn_send.configure(state="normal")
+            entry.focus_set()
+            
         # Небольшая задержка для эффекта "печати"
-        app.after(300, lambda: process_command(query))
+        app.after(300, run_and_unlock)
 
     entry.bind("<Return>", send_msg)
     
@@ -34046,8 +34097,15 @@ def _apply_glass_effects(widget, depth=0):
                     try: w.configure(border_color="#4FC3F7", border_width=2)
                     except: pass
                 def on_leave(e, w=widget, obc=bc):
-                    try: w.configure(border_color=obc, border_width=1)
-                    except: pass
+                    def check_later():
+                        try:
+                            x, y = w.winfo_pointerxy()
+                            rx, ry = w.winfo_rootx(), w.winfo_rooty()
+                            rw, rh = w.winfo_width(), w.winfo_height()
+                            if not (rx <= x <= rx + rw and ry <= y <= ry + rh):
+                                w.configure(border_color=obc, border_width=1)
+                        except: pass
+                    w.after(15, check_later)
                 
                 if not getattr(widget, "_has_glow", False):
                     widget.bind("<Enter>", on_enter, add="+")
@@ -34416,6 +34474,16 @@ content.pack(side="left", fill="both", expand=True)
 
 
 def _full_exit():
+    try:
+        # Сохраняем размер окна перед выходом
+        w = app.winfo_width()
+        h = app.winfo_height()
+        if w > 100 and h > 100:
+            _STATE["win_w"] = w
+            _STATE["win_h"] = h
+            _save_settings()
+    except Exception:
+        pass
     try:
         _monitor_state["active"] = False
     except Exception:
