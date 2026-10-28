@@ -477,6 +477,17 @@ def _create_manual_launch_task():
     """
     Создаёт задачу по событию (ID 1001) + .bat для 100% надёжности.
     """
+    if not is_admin():
+        return
+    try:
+        # Проверяем, существует ли задача. Если да — выходим.
+        r = subprocess.run(["schtasks", "/Query", "/TN", MANUAL_TASK_NAME], 
+                           capture_output=True, timeout=5, creationflags=CREATE_NO_WINDOW)
+        if r.returncode == 0:
+            return
+    except Exception:
+        pass
+
     pyw = _get_pythonw_path()
     app_path = os.path.abspath(__file__)
     user_domain = os.environ.get('USERDOMAIN', '')
@@ -695,6 +706,10 @@ def _load_settings():
         log_error("_load_settings: файл поврежден", e)
         # Делаем бэкап поврежденного файла
         try:
+            # Удаляем старые .bad файлы
+            for old_bad in glob.glob(f"{SETTINGS_PATH}.*.bad"):
+                try: os.remove(old_bad)
+                except: pass
             bad_path = f"{SETTINGS_PATH}.{int(time.time())}.bad"
             shutil.copy2(SETTINGS_PATH, bad_path)
             log_error("_load_settings", Exception(f"Копия поврежденного файла сохранена в {bad_path}"))
@@ -716,10 +731,13 @@ def _load_settings():
         pass
 
 
+_settings_lock = threading.Lock()
+
 def _save_settings():
     try:
-        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
-            json.dump({
+        with _settings_lock:
+            with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump({
                 "auto_clean_browser": _STATE["auto_clean_browser"],
                 "current_profile": _STATE["current_profile"],
                 "minimize_to_tray": _STATE.get("minimize_to_tray", True),
@@ -731,6 +749,15 @@ def _save_settings():
             }, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+def _safe_startfile(path):
+    """Безопасно открывает файл или папку в проводнике."""
+    try:
+        if os.path.exists(path):
+            _safe_startfile(path)
+    except Exception as e:
+        log_error(f"_safe_startfile({path})", e)
 
 
 # ================== ХЕЛПЕРЫ ==================
@@ -3299,7 +3326,7 @@ def open_large_files_window():
 
                     def mk_open(p=fp):
                         def do():
-                            try: os.startfile(os.path.dirname(p))
+                            try: _safe_startfile(os.path.dirname(p))
                             except Exception: pass
                         return do
 
@@ -3636,8 +3663,10 @@ def _rp_get_points_detailed():
     try:
         ps = (
             "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;"
+            "$inv = [System.Globalization.CultureInfo]::InvariantCulture; "
             "Get-ComputerRestorePoint | "
-            "Select-Object SequenceNumber,Description,CreationTime,"
+            "Select-Object SequenceNumber,Description,"
+            "@{n='CreationTime';e={$_.CreationTime.ToString('yyyy-MM-dd HH:mm:ss', $inv)}},"
             "RestorePointType | ConvertTo-Json -Compress"
         )
         r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
@@ -4580,7 +4609,7 @@ def _find_ohm_exe():
     return None
 
 
-_OHM_STARTED_BY_US = {"value": False}
+_OHM_STARTED_BY_US = {"value": False, "pid": None}
 
 
 def _ensure_ohm_running():
@@ -4604,15 +4633,21 @@ def _ensure_ohm_running():
         
         # 2. Проверяем, есть ли задача в Планировщике. Если нет — создаем (один раз).
         r = subprocess.run(["schtasks", "/query", "/tn", task_name], capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW)
-        if r.returncode != 0:
-            # Задачи нет — создаем её (только если есть права админа)
-            if is_admin():
+        
+        run_ok = False
+        if is_admin():
+            if r.returncode != 0:
+                # Задачи нет — создаем её
                 cmd_create = ["schtasks", "/create", "/tn", task_name, 
                               "/tr", f'"{exe}" -minimized', 
                               "/sc", "once", "/st", "00:00", "/ru", "SYSTEM", "/f"]
                 subprocess.run(cmd_create, capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+            
+            # 3. Запускаем задачу (теперь это происходит мгновенно)
+            r_run = subprocess.run(["schtasks", "/run", "/tn", task_name], capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+            run_ok = (r_run.returncode == 0)
         
-        if r_run.returncode != 0:
+        if not run_ok:
             # Если не удалось запустить от SYSTEM (например, нет прав), 
             # запускаем обычным способом и скрываем окно через WinAPI
             p = subprocess.Popen([exe, "-minimized"], cwd=os.path.dirname(exe), creationflags=CREATE_NO_WINDOW)
@@ -4629,9 +4664,18 @@ def _ensure_ohm_running():
                 pass
                 
         _OHM_STARTED_BY_US["value"] = True
-        
-        # Убрали жесткий sleep(3). Программа сама подхватит данные, 
-        # как только OHM их отдаст (WMI обновляется каждые 2-3 секунды).
+        if run_ok:
+            # Пытаемся получить PID процесса, запущенного через задачу
+            try:
+                import psutil
+                for proc in psutil.process_iter(['pid', 'name']):
+                    if (proc.info['name'] or '').lower() == 'openhardwaremonitor.exe':
+                        _OHM_STARTED_BY_US["pid"] = proc.info['pid']
+                        break
+            except Exception:
+                pass
+        else:
+            _OHM_STARTED_BY_US["pid"] = p.pid
         return True
     except Exception as e:
         log_error("_ensure_ohm_running", e)
@@ -4645,16 +4689,18 @@ def _kill_ohm():
     """
     if not _OHM_STARTED_BY_US.get("value"):
         return
+    pid = _OHM_STARTED_BY_US.get("pid")
     try:
         import psutil
-        for p in psutil.process_iter(["name"]):
+        if pid:
             try:
-                n = (p.info.get("name") or "").lower()
-                if n == "openhardwaremonitor.exe":
+                p = psutil.Process(pid)
+                if p.name().lower() == "openhardwaremonitor.exe":
                     p.kill()
-            except Exception:
-                continue
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
         _OHM_STARTED_BY_US["value"] = False
+        _OHM_STARTED_BY_US["pid"] = None
     except Exception:
         pass
 
@@ -5012,10 +5058,12 @@ def _get_vram_from_registry(gpu_name):
 def _get_top_processes(n=5):
     try:
         import psutil
-        # Принудительный первый вызов, чтобы заполнить счетчики CPU
-        psutil.cpu_percent(percpu=False)
+        # Первый проход для инициализации счетчиков
+        for p in psutil.process_iter(["pid"]):
+            try: p.cpu_percent(None)
+            except: pass
+        time.sleep(0.4) # Ждем для корректного замера
         
-        # Исключаем "мусорные" — Idle и System
         SKIP = {"System Idle Process", "Idle", "System"}
         procs = []
         for p in psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]):
@@ -5034,27 +5082,6 @@ def _get_top_processes(n=5):
         return top_cpu, top_ram
     except Exception:
         return [], []
-
-
-def _get_system_extended():
-    info = {}
-    if not WMI_AVAILABLE:
-        return info
-    try:
-        w = wmi.WMI()
-        for b in w.Win32_BaseBoard():
-            info["motherboard"] = f"{b.Manufacturer} {b.Product}"
-            break
-        for bios in w.Win32_BIOS():
-            info["bios"] = f"{bios.Manufacturer} {bios.SMBIOSBIOSVersion}"
-            break
-        for cs in w.Win32_ComputerSystem():
-            info["manufacturer"] = cs.Manufacturer
-            info["model"] = cs.Model
-            break
-    except Exception:
-        pass
-    return info
 
 
 def _export_monitor_report():
@@ -5099,7 +5126,7 @@ def _export_monitor_report():
         with open(path, "w", encoding="utf-8-sig") as f:
             f.write("\n".join(lines))
         messagebox.showinfo("Готово", f"Отчёт сохранён:\n{path}")
-        os.startfile(os.path.dirname(path))
+        _safe_startfile(os.path.dirname(path))
     except Exception as e:
         messagebox.showerror("Ошибка", str(e))
 
@@ -6068,7 +6095,7 @@ def _th_worker():
     samples = _th_load()
     while True:
         try:
-            temps = _get_temperatures()
+            temps = get_cached_temperatures()
             cpu = temps.get("cpu")
             gpu = temps.get("gpu")
             if cpu is not None or gpu is not None:
@@ -6525,7 +6552,7 @@ def open_temp_history_window():
                     ])
             messagebox.showinfo("Готово", f"CSV сохранён:\n{path}")
             try:
-                os.startfile(os.path.dirname(path))
+                _safe_startfile(os.path.dirname(path))
             except Exception:
                 pass
         except Exception as e:
@@ -6976,6 +7003,7 @@ def build_monitor_page(parent):
 
     def start_monitor():
         _monitor_state["active"] = True
+        _monitor_state["user_active"] = True
         start_btn.configure(state="disabled", text="Работает...")
         stop_btn.configure(state="normal")
         threading.Thread(target=_ensure_ohm_running, daemon=True).start()
@@ -6983,6 +7011,7 @@ def build_monitor_page(parent):
 
     def stop_monitor():
         _monitor_state["active"] = False
+        _monitor_state["user_active"] = False
         start_btn.configure(state="normal", text="▶ Запустить")
         stop_btn.configure(state="disabled")
         threading.Thread(target=_kill_ohm, daemon=True).start()
@@ -7658,7 +7687,7 @@ def refresh_autostart_ui():
         if it.get("exe") and it["file_exists"]:
             def make_open(path=it["exe"]):
                 def do():
-                    try: os.startfile(os.path.dirname(path))
+                    try: _safe_startfile(os.path.dirname(path))
                     except Exception: pass
                 return do
             ctk.CTkButton(btns, text="📂", width=36, height=28, font=("Inter", 12),
@@ -7685,7 +7714,7 @@ def refresh_autostart_ui():
             else: m.add_command(label="🟢 Включить", command=lambda: enable_item(item))
             m.add_separator()
             if item.get("exe") and item["file_exists"]:
-                m.add_command(label="📂 Открыть папку", command=lambda p=item["exe"]: os.startfile(os.path.dirname(p)))
+                m.add_command(label="📂 Открыть папку", command=lambda p=item["exe"]: _safe_startfile(os.path.dirname(p)))
             m.add_command(label="📋 Копировать команду", command=lambda c=item["command"]: (app.clipboard_clear(), app.clipboard_append(c)))
             m.add_command(label="📋 Копировать имя", command=lambda n=item["name"]: (app.clipboard_clear(), app.clipboard_append(n)))
             return m
@@ -8787,7 +8816,7 @@ def _sched_export_all():
                     f"Не удалось: {failed}\n\n"
                     f"Папка: {backup_dir}")
                 try:
-                    os.startfile(backup_dir)
+                    _safe_startfile(backup_dir)
                 except Exception:
                     pass
             app.after(0, finish)
@@ -9298,7 +9327,7 @@ def open_autostart_diff_window():
                 def mk_open(p=it["exe"]):
                     def do():
                         try:
-                            os.startfile(os.path.dirname(p))
+                            _safe_startfile(os.path.dirname(p))
                         except Exception:
                             pass
                     return do
@@ -9403,7 +9432,7 @@ def open_autostart_diff_window():
                 f.write("\n".join(lines))
             messagebox.showinfo("Готово", f"Отчёт сохранён:\n{path}")
             try:
-                os.startfile(os.path.dirname(path))
+                _safe_startfile(os.path.dirname(path))
             except Exception:
                 pass
         except Exception as e:
@@ -13181,7 +13210,7 @@ def _export_disk_report(letter):
             app.after(0, lambda: messagebox.showinfo(
                 "Готово", f"Отчёт сохранён:\n{path}"))
             try:
-                os.startfile(os.path.dirname(path))
+                _safe_startfile(os.path.dirname(path))
             except Exception:
                 pass
         except Exception as e:
@@ -14166,7 +14195,7 @@ def show_output_dialog(title, text, summary=None):
         try:
             with open(path, "w", encoding="utf-8-sig") as f: f.write(text)
             messagebox.showinfo("Готово", f"Сохранено:\n{path}")
-            try: os.startfile(os.path.dirname(path))
+            try: _safe_startfile(os.path.dirname(path))
             except Exception: pass
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
@@ -15273,7 +15302,7 @@ def diag_full_zip_report():
             msg += "\n\nОткрыть папку?"
             if messagebox.askyesno("Отчёт готов", msg):
                 try:
-                    os.startfile(os.path.dirname(path))
+                    _safe_startfile(os.path.dirname(path))
                 except Exception:
                     pass
 
@@ -17159,7 +17188,7 @@ def _program_open_folder(prog):
             f"Не удалось определить папку установки для:\n{prog['name']}")
         return
     try:
-        os.startfile(d)
+        _safe_startfile(d)
     except Exception as e:
         messagebox.showerror("Ошибка", str(e))
 
@@ -19849,7 +19878,7 @@ def _refresh_portable_ui(query="", sort_by="По имени"):
         btns = ctk.CTkFrame(row, fg_color="transparent")
         btns.pack(fill="x", padx=10, pady=(0, 8))
 
-        ctk.CTkButton(btns, text="📂 Папка", width=100, height=28, font=("Inter", 11, "bold"), fg_color="#1F2E4A", hover_color="#2E5A8E", corner_radius=14, command=lambda p=it["folder"]: os.startfile(p)).pack(side="left", padx=(0, 4))
+        ctk.CTkButton(btns, text="📂 Папка", width=100, height=28, font=("Inter", 11, "bold"), fg_color="#1F2E4A", hover_color="#2E5A8E", corner_radius=14, command=lambda p=it["folder"]: _safe_startfile(p)).pack(side="left", padx=(0, 4))
         ctk.CTkButton(btns, text="🗑 В Корзину", width=110, height=28, font=("Inter", 11, "bold"), fg_color="#C62828", hover_color="#E53935", corner_radius=14, command=lambda p=it["path"]: _portable_delete_items([p])).pack(side="left", padx=4)
 
 
@@ -20185,7 +20214,7 @@ def _iw_save_meta(session_dir, meta):
 
 def _iw_open_session_folder(sdir):
     try:
-        os.startfile(sdir)
+        _safe_startfile(sdir)
     except Exception:
         pass
 
@@ -22434,23 +22463,6 @@ def _set_bench_profile(key):
         text=f"Профиль: {p.get('name', key)} • {p.get('desc', '')}",
         text_color="#4FC3F7")
 
-def _start_bench_profile():
-    key = bench_ui.get("active_profile", "full")
-
-    def worker():
-        try:
-            run_benchmark(key)
-        except Exception as e:
-            log_error("start_bench_profile", e)
-            app.after(0, lambda: bench_ui["status"].configure(
-                text=f"Ошибка: {e}", text_color="#FF8A8A"))
-            bench_running["active"] = False
-            app.after(0, lambda: bench_ui["start_btn"].configure(
-                state="normal", text="▶ ЗАПУСТИТЬ"))
-
-    threading.Thread(target=worker, daemon=True).start()
-    bench_ui["start_btn"].configure(state="disabled", text="⏳...")
-
 
 # ================== ДРАЙВЕРЫ ==================
 def wu_search_drivers():
@@ -22775,7 +22787,7 @@ def _drivers_backup():
                     f"Бэкап сохранён в:\n{backup_dir}\n\n"
                     f"Драйверов: {exported}\n\nОткрыть папку?"):
                     try:
-                        os.startfile(backup_dir)
+                        _safe_startfile(backup_dir)
                     except Exception:
                         pass
             app.after(0, finish)
@@ -24992,7 +25004,7 @@ def open_driver_online_search_window():
                     f"Папка: {dl_dir}\n\n"
                     f"Открыть папку?"):
                     try:
-                        os.startfile(dl_dir)
+                        _safe_startfile(dl_dir)
                     except Exception:
                         pass
             app.after(0, finish)
@@ -25058,7 +25070,7 @@ def open_driver_online_search_window():
     ctk.CTkButton(btn_row, text="📂 Папка загрузок", height=40,
                   font=("Inter", 13, "bold"), fg_color="#455A64",
                   hover_color="#546E7A", corner_radius=20,
-                  command=lambda: os.startfile(
+                  command=lambda: _safe_startfile(
                       os.path.join(BASE_DIR, "driver_downloads"))
                   if os.path.isdir(os.path.join(BASE_DIR,
                                                   "driver_downloads"))
@@ -27234,7 +27246,7 @@ def open_scripts_library():
     btn_row = ctk.CTkFrame(win, fg_color="transparent")
     btn_row.pack(pady=(0, 16), padx=20, fill="x")
     ctk.CTkButton(btn_row, text="➕ Добавить скрипт", height=38, font=("Inter", 12, "bold"), fg_color="#2E7D32", hover_color="#43A047", corner_radius=19, command=add_script).pack(side="left", padx=(0, 4), fill="x", expand=True)
-    ctk.CTkButton(btn_row, text="📂 Открыть папку", height=38, font=("Inter", 12, "bold"), fg_color="#1F2E4A", hover_color="#2E5A8E", corner_radius=19, command=lambda: (_task_ensure_dirs(), os.startfile(SCRIPTS_DIR))).pack(side="left", padx=4, fill="x", expand=True)
+    ctk.CTkButton(btn_row, text="📂 Открыть папку", height=38, font=("Inter", 12, "bold"), fg_color="#1F2E4A", hover_color="#2E5A8E", corner_radius=19, command=lambda: (_task_ensure_dirs(), _safe_startfile(SCRIPTS_DIR))).pack(side="left", padx=4, fill="x", expand=True)
     ctk.CTkButton(btn_row, text="Закрыть", height=38, font=("Inter", 12, "bold"), fg_color="#455A64", hover_color="#546E7A", corner_radius=19, command=win.destroy).pack(side="left", padx=(4, 0), fill="x", expand=True)
     render()
 
@@ -28432,7 +28444,7 @@ def save_report_pdf():
         if messagebox.askyesno("Готово",
                                 f"PDF сохранён:\n{path}\n\nОткрыть?"):
             try:
-                os.startfile(path)
+                _safe_startfile(path)
             except Exception:
                 pass
     except Exception as e:
@@ -28457,7 +28469,7 @@ def save_report_html():
             f.write(html)
         if messagebox.askyesno("Готово", f"Сохранено: {path}\n\nОткрыть?"):
             try:
-                os.startfile(path)
+                _safe_startfile(path)
             except Exception:
                 pass
     except Exception as e:
@@ -28596,7 +28608,7 @@ def save_report_json():
         if messagebox.askyesno("Готово",
                                 f"JSON сохранён:\n{path}\n\nОткрыть?"):
             try:
-                os.startfile(path)
+                _safe_startfile(path)
             except Exception:
                 pass
     except Exception as e:
@@ -28624,7 +28636,7 @@ def save_report_md():
         if messagebox.askyesno("Готово",
                                 f"Markdown сохранён:\n{path}\n\nОткрыть?"):
             try:
-                os.startfile(path)
+                _safe_startfile(path)
             except Exception:
                 pass
     except Exception as e:
@@ -29120,7 +29132,7 @@ def open_diagnostics_report():
             def _safe_open():
                 try:
                     if os.path.exists(path):
-                        os.startfile(path)
+                        _safe_startfile(path)
                 except Exception:
                     pass
             app.after(100, _safe_open)
@@ -29893,7 +29905,7 @@ def open_inventory_report():
             except Exception:
                 pass
             app.after(0, dlg.destroy)
-            app.after(100, lambda: os.startfile(path))
+            app.after(100, lambda: _safe_startfile(path))
 
         app.after(0, finish)
 
@@ -32151,14 +32163,14 @@ def _open_about():
 
     def open_folder():
         try:
-            os.startfile(BASE_DIR)
+            _safe_startfile(BASE_DIR)
         except Exception:
             pass
 
     def open_log():
         if os.path.exists(ERRORS_LOG):
             try:
-                os.startfile(ERRORS_LOG)
+                _safe_startfile(ERRORS_LOG)
             except Exception:
                 pass
         else:
@@ -32236,7 +32248,7 @@ def _open_disk_management():
         pass
     # Способ 2: через os.startfile (ассоциация .msc)
     try:
-        os.startfile("diskmgmt.msc")
+        _safe_startfile("diskmgmt.msc")
         return
     except Exception:
         pass
@@ -34579,6 +34591,7 @@ def _full_exit():
         pass
     try:
         _monitor_state["active"] = False
+        _dashboard_state["active"] = False
     except Exception:
         pass
     try:
@@ -34698,15 +34711,15 @@ def _do_show_window():
         app.lift()
         app.focus_force()
         
-        # Возобновляем циклы, если открыты нужные страницы
-        if "monitor" in page_frames and page_frames["monitor"].winfo_ismapped():
-            if not _monitor_state["active"]:
-                _monitor_state["active"] = True
-                _monitor_update_loop()
-        if "dashboard" in page_frames and page_frames["dashboard"].winfo_ismapped():
-            if not _dashboard_state["active"]:
-                _dashboard_state["active"] = True
-                _update_dashboard()
+        # Возобновляем мониторинг, если он был запущен пользователем
+        if _monitor_state.get("user_active", False) and not _monitor_state["active"]:
+            _monitor_state["active"] = True
+            _monitor_update_loop()
+            
+        # Возобновляем дашборд
+        if not _dashboard_state["active"]:
+            _dashboard_state["active"] = True
+            _update_dashboard()
     except Exception:
         pass
 
