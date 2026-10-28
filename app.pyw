@@ -50,7 +50,7 @@ SETTINGS_PATH = os.path.join(BASE_DIR, "optix_settings.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backup_deleted")
 SCHEDULER_TASK_NAME = "Optix_Scheduler"
 CREATE_NO_WINDOW = 0x08000000
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.2"
 
 # ⬆ GitHub-репозиторий для проверки обновлений.
 # Формат: "username/repo" (без https://github.com/)
@@ -4379,21 +4379,47 @@ def open_restore_points():
 
     def create_point():
         name = f"Optix_{datetime.now().strftime('%Y-%m-%d_%H-%M')}"
-        try:
-            ps = (f"Checkpoint-Computer -Description '{name}' "
-                  f"-RestorePointType 'MODIFY_SETTINGS'")
-            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                               capture_output=True, text=True, timeout=180,
-                               creationflags=CREATE_NO_WINDOW,
-                               encoding="utf-8", errors="replace")
-            if r.returncode == 0:
-                messagebox.showinfo("Готово", f"Точка создана: {name}")
-                refresh()
-            else:
-                messagebox.showerror("Ошибка",
-                    (r.stderr or r.stdout)[:500])
-        except Exception as e:
-            messagebox.showerror("Ошибка", str(e))
+        
+        dlg = ctk.CTkToplevel(win)
+        dlg.title("Создание точки")
+        dlg.geometry("400x180")
+        dlg.transient(win)
+        dlg.grab_set()
+        _center_window(dlg)
+        
+        ctk.CTkLabel(dlg, text="⏳ Создание точки восстановления...\nПожалуйста, подождите.", 
+                     font=("Inter", 14), justify="center").pack(pady=30, padx=20)
+        pb = ctk.CTkProgressBar(dlg, mode="indeterminate", height=12, progress_color="#4FC3F7")
+        pb.pack(pady=10, padx=40, fill="x")
+        pb.start()
+        
+        result = {"ok": False, "msg": ""}
+        
+        def worker():
+            try:
+                ps = (f"Checkpoint-Computer -Description '{name}' "
+                      f"-RestorePointType 'MODIFY_SETTINGS'")
+                r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                   capture_output=True, text=True, timeout=180,
+                                   creationflags=CREATE_NO_WINDOW,
+                                   encoding="utf-8", errors="replace")
+                if r.returncode == 0:
+                    result["ok"] = True
+                else:
+                    result["msg"] = (r.stderr or r.stdout)[:500]
+            except Exception as e:
+                result["msg"] = str(e)
+            finally:
+                app.after(0, dlg.destroy)
+                
+        threading.Thread(target=worker, daemon=True).start()
+        dlg.wait_window()
+        
+        if result["ok"]:
+            messagebox.showinfo("Готово", f"Точка создана: {name}")
+            refresh()
+        else:
+            messagebox.showerror("Ошибка", result["msg"])
 
     # ─── Кнопки действий ───
     act1 = ctk.CTkFrame(win, fg_color="transparent")
@@ -5029,7 +5055,7 @@ def _export_monitor_report():
         cpu = psutil.cpu_percent(interval=None)
         freq = psutil.cpu_freq()
         lines.append(f"CPU: {cpu:.1f}%  |  Частота: {freq.current:.0f} МГц")
-        temps = _get_temperatures()
+        temps = get_cached_temperatures()
         if temps["cpu"]:
             lines.append(f"  Температура CPU: {temps['cpu']} °C")
         if temps["gpu"]:
@@ -5138,6 +5164,21 @@ def _draw_graph(canvas, data, color, max_val=100, min_val=0, warn_line=None, uni
                            fill=color, font=("Inter", 12, "bold"), anchor="se")
 
 
+def _monitor_collect_bg():
+    """Фоновый сборщик тяжелых данных для мониторинга."""
+    import psutil
+    try:
+        top_cpu, top_ram = _get_top_processes()
+        disks_text = ""
+        for part in psutil.disk_partitions(all=False):
+            try:
+                u = psutil.disk_usage(part.mountpoint)
+                disks_text += f"💾 {part.mountpoint}  {u.used/(1024**3):.1f}/{u.total/(1024**3):.1f} ГБ  ({u.percent:.0f}%)\n"
+            except Exception: continue
+        _monitor_state["top_cache"] = {"cpu": top_cpu, "ram": top_ram, "disks": disks_text}
+    except Exception as e:
+        log_error("_monitor_collect_bg", e)
+
 def _monitor_update_loop():
     if not _monitor_state["active"]:
         return
@@ -5163,12 +5204,11 @@ def _monitor_update_loop():
             w["ram_value"].configure(text=f"{ram.used / (1024**3):.1f} / {ram.total / (1024**3):.1f} ГБ", text_color=ram_color)
             _animate_bar(w["ram_bar"], w["ram_bar"].get(), ram.percent / 100, duration=400)
 
-        disks_text = ""
-        for part in psutil.disk_partitions(all=False):
-            try:
-                u = psutil.disk_usage(part.mountpoint)
-                disks_text += f"💾 {part.mountpoint}  {u.used/(1024**3):.1f}/{u.total/(1024**3):.1f} ГБ  ({u.percent:.0f}%)\n"
-            except Exception: continue
+        # Берем диски из кэша
+        if _monitor_state.get("top_cache"):
+            disks_text = _monitor_state["top_cache"]["disks"]
+        else:
+            disks_text = ""
         if "disks_label" in w:
             w["disks_label"].configure(text=disks_text.strip() or "—")
 
@@ -5247,7 +5287,11 @@ def _monitor_update_loop():
 
     # ─── Топ процессов ───
     try:
-        top_cpu, top_ram = _get_top_processes()
+        if _monitor_state.get("top_cache"):
+            top_cpu = _monitor_state["top_cache"]["cpu"]
+            top_ram = _monitor_state["top_cache"]["ram"]
+        else:
+            top_cpu, top_ram = [], []
         w = _monitor_widgets
         
         if "top_cpu_rows" in w:
@@ -5279,6 +5323,8 @@ def _monitor_update_loop():
         log_error("monitor_loop_tops", e)
 
     # Увеличили интервал до 3 сек, чтобы снизить нагрузку от psutil
+    # Запускаем сбор данных в фоне
+    threading.Thread(target=_monitor_collect_bg, daemon=True).start()
     app.after(3000, _monitor_update_loop)
 
 
@@ -10630,72 +10676,6 @@ def rollback_memory_optimize():
     )
 
 
-# ================== ОПТИМИЗАЦИЯ СЕТИ ==================
-def apply_network_optimize():
-    results = []
-    try:
-        r = subprocess.run(
-            ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=CREATE_NO_WINDOW
-        )
-        results.append("autotuning" if r.returncode == 0 else "autotuning FAIL")
-        r = subprocess.run(
-            ["netsh", "int", "tcp", "set", "global", "rss=enabled"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=CREATE_NO_WINDOW
-        )
-        results.append("rss" if r.returncode == 0 else "rss FAIL")
-
-        ok1, _ = set_reg(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
-            "TcpAckFrequency", 1, winreg.REG_DWORD
-        )
-        ok2, _ = set_reg(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
-            "TCPNoDelay", 1, winreg.REG_DWORD
-        )
-        ok3, _ = set_reg(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters",
-            "TcpDelAckTicks", 0, winreg.REG_DWORD
-        )
-        results.append("TcpAckFrequency" if ok1 else "TcpAckFrequency FAIL")
-        results.append("TCPNoDelay" if ok2 else "TCPNoDelay FAIL")
-        results.append("TcpDelAckTicks" if ok3 else "TcpDelAckTicks FAIL")
-
-        _safe_tweak_update("network_status",
-                           f"🌐 Применено: {', '.join(results)}",
-                           "#7CFC7C")
-        
-        show_toast("Optix — оптимизация сети",
-                   "TCP-параметры применены. Перезагрузите ПК.")
-    except Exception as e:
-        log_error("apply_network_optimize", e)
-        tweak_widgets["network_status"].configure(
-            text=f"Ошибка: {e}", text_color="#FF8A8A"
-        )
-
-
-def rollback_network_optimize():
-    try:
-        subprocess.run(
-            ["netsh", "int", "tcp", "set", "global", "autotuninglevel=normal"],
-            capture_output=True, text=True, timeout=15,
-            creationflags=CREATE_NO_WINDOW
-        )
-        tweak_widgets["network_status"].configure(
-            text="🌐 Сброшено на стандарт", text_color="#4FC3F7"
-        )
-    except Exception as e:
-        log_error("rollback_network_optimize", e)
-        tweak_widgets["network_status"].configure(
-            text=f"Ошибка: {e}", text_color="#FF8A8A"
-        )
-
-
 # ================== ФОНОВЫЕ UWP ==================
 def apply_uwp_background_off():
     tw = [
@@ -13504,27 +13484,36 @@ def open_disk_analyzer(letter):
 def run_trim(letter):
     if not messagebox.askyesno(f"TRIM {letter}:", "Оптимизировать SSD?"):
         return
-    try:
-        r = subprocess.run(["defrag", f"{letter}:", "/L"],
-                           capture_output=True, timeout=180,
-                           creationflags=CREATE_NO_WINDOW)
-        out = _decode_console_bytes(r.stdout or b"")
-        messagebox.showinfo("TRIM", out[:1500])
-    except Exception as e:
-        messagebox.showerror("Ошибка", str(e))
-
+    def worker():
+        try:
+            r = subprocess.run(["defrag", f"{letter}:", "/L"],
+                               capture_output=True, timeout=180,
+                               creationflags=CREATE_NO_WINDOW)
+            out = _decode_console_bytes(r.stdout or b"")
+            app.after(0, lambda: messagebox.showinfo("TRIM", out[:1500]))
+        except subprocess.TimeoutExpired:
+            app.after(0, lambda: messagebox.showerror("Ошибка", "Таймаут (3 минуты)"))
+        except Exception as e:
+            log_error("run_trim", e)
+            app.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+    threading.Thread(target=worker, daemon=True).start()
 
 def run_defrag(letter):
     if not messagebox.askyesno(f"Дефраг {letter}:", "Продолжить?"):
         return
-    try:
-        r = subprocess.run(["defrag", f"{letter}:", "/O"],
-                           capture_output=True, timeout=600,
-                           creationflags=CREATE_NO_WINDOW)
-        out = _decode_console_bytes(r.stdout or b"")
-        messagebox.showinfo("Дефрагментация", out[:1500])
-    except Exception as e:
-        messagebox.showerror("Ошибка", str(e))
+    def worker():
+        try:
+            r = subprocess.run(["defrag", f"{letter}:", "/O"],
+                               capture_output=True, timeout=600,
+                               creationflags=CREATE_NO_WINDOW)
+            out = _decode_console_bytes(r.stdout or b"")
+            app.after(0, lambda: messagebox.showinfo("Дефрагментация", out[:1500]))
+        except subprocess.TimeoutExpired:
+            app.after(0, lambda: messagebox.showerror("Ошибка", "Таймаут (10 минут)"))
+        except Exception as e:
+            log_error("run_defrag", e)
+            app.after(0, lambda: messagebox.showerror("Ошибка", str(e)))
+    threading.Thread(target=worker, daemon=True).start()
 
 
 # ================== ОБНОВЛЁННЫЙ UI ДИСКОВ ==================
@@ -14199,6 +14188,7 @@ def _show_busy_dialog(title, message="Выполняется..."):
     pb = ctk.CTkProgressBar(frame, width=350, height=12, progress_color="#4FC3F7", mode="indeterminate", corner_radius=6)
     pb.pack(pady=(0, 20))
     pb.start()
+    dlg.after(1, dlg.update_idletasks) # Безопасная отрисовка интерфейса
     
     def close_dlg():
         try:
@@ -15383,10 +15373,9 @@ def _get_default_gateway():
     """Возвращает IP основного шлюза или None."""
     import re
     try:
-        r = subprocess.run(["ipconfig"], capture_output=True, text=True,
-                           timeout=10, creationflags=CREATE_NO_WINDOW,
-                           encoding="cp866", errors="replace")
-        out = r.stdout or ""
+        r = subprocess.run(["ipconfig"], capture_output=True,
+                           timeout=10, creationflags=CREATE_NO_WINDOW)
+        out = _decode_console_bytes(r.stdout or b"")
         # Русская Windows: "Основной шлюз . . . . . . . . . : 192.168.1.1"
         for pat in (r"Основной шлюз[^\:]*:\s*([\d\.]+)",
                      r"Default Gateway[^\:]*:\s*([\d\.]+)"):
@@ -21909,7 +21898,16 @@ def load_bench_history():
     try:
         with open(BENCH_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return []
+    except Exception as e:
+        log_error("load_bench_history: файл поврежден", e)
+        try:
+            bad_path = BENCH_PATH + ".bad"
+            shutil.copy2(BENCH_PATH, bad_path)
+            log_error("load_bench_history", Exception(f"Копия сохранена в {bad_path}"))
+        except Exception:
+            pass
         return []
 
 
@@ -21954,7 +21952,6 @@ def run_benchmark(profile_key="full"):
             bench_ui["progress"].set((i + 1) / t)
             
         app.after(0, _update_ui, name, idx, total_tests, eta)
-        app.update()
         
         try:
             result = func()
@@ -23397,7 +23394,6 @@ def _driver_ensure_restore_point():
     need_create = False
     if last:
         try:
-            # last может быть в формате WMI: /Date(1699999999999)/ или ISO
             import re as _re
             m = _re.search(r"/Date\((\d+)\)/", last)
             if m:
@@ -23423,12 +23419,40 @@ def _driver_ensure_restore_point():
     if not messagebox.askyesno("Точка восстановления", msg):
         return False
 
-    ok, info = _driver_create_restore_point()
-    if ok:
-        messagebox.showinfo("Готово", f"Точка создана: {info}")
+    # Создаем окно прогресса
+    dlg = ctk.CTkToplevel(app)
+    dlg.title("Точка восстановления")
+    dlg.geometry("400x200")
+    dlg.transient(app)
+    dlg.grab_set()
+    _center_window(dlg)
+    
+    ctk.CTkLabel(dlg, text="⏳ Создание точки восстановления...\nЭто может занять до 3 минут.", 
+                 font=("Inter", 14), justify="center").pack(pady=30, padx=20)
+    pb = ctk.CTkProgressBar(dlg, mode="indeterminate", height=12, progress_color="#4FC3F7")
+    pb.pack(pady=10, padx=40, fill="x")
+    pb.start()
+    
+    result_holder = {"ok": False, "info": ""}
+    
+    def worker():
+        try:
+            ok, info = _driver_create_restore_point()
+            result_holder["ok"] = ok
+            result_holder["info"] = info
+        except Exception as e:
+            result_holder["info"] = str(e)
+        finally:
+            app.after(0, dlg.destroy)
+            
+    threading.Thread(target=worker, daemon=True).start()
+    dlg.wait_window() # Ждем, пока окно не закроется
+    
+    if result_holder["ok"]:
+        messagebox.showinfo("Готово", f"Точка создана: {result_holder['info']}")
         return True
     else:
-        messagebox.showerror("Ошибка", f"Не создать точку:\n{info}")
+        messagebox.showerror("Ошибка", f"Не создать точку:\n{result_holder['info']}")
         return False
 
 
@@ -33159,7 +33183,7 @@ _button_pulse_state = {}
 def _start_button_pulse(btn, base_color, pulse_color="#ffffff"):
     """Запускает пульсацию кнопки (меняет цвет), пока идет процесс."""
     if btn in _button_pulse_state:
-        return
+        _stop_button_pulse(btn) # Сбрасываем застрявшее состояние
     _button_pulse_state[btn] = {"active": True, "step": 0, "base": base_color, "pulse": pulse_color}
     
     def _pulse():
@@ -34176,10 +34200,19 @@ def show_page(name):
             globals()["_page_anim_id"] = {"id": None}
             
         def _animate_step(i=0):
-            steps = 12
-            if i > steps:
-                target_frame.place_forget()
-                target_frame.pack(fill="both", expand=True)
+            try:
+                steps = 12
+                if i > steps:
+                    target_frame.place_forget()
+                    target_frame.pack(fill="both", expand=True)
+                    _page_anim_id["id"] = None
+                    # Запускаем эффекты карточек после того, как страница встала на место
+                    _apply_glass_effects(target_frame)
+                    return
+                
+                # ... остальной код анимации ...
+            except Exception as e:
+                log_error("show_page_animation_step", e)
                 _page_anim_id["id"] = None
                 
                 # Запускаем эффекты карточек после того, как страница встала на место
