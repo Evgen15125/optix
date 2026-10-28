@@ -50,7 +50,7 @@ SETTINGS_PATH = os.path.join(BASE_DIR, "optix_settings.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backup_deleted")
 SCHEDULER_TASK_NAME = "Optix_Scheduler"
 CREATE_NO_WINDOW = 0x08000000
-APP_VERSION = "1.8.2"
+APP_VERSION = "1.8.3"
 
 # ⬆ GitHub-репозиторий для проверки обновлений.
 # Формат: "username/repo" (без https://github.com/)
@@ -695,7 +695,7 @@ def _load_settings():
         log_error("_load_settings: файл поврежден", e)
         # Делаем бэкап поврежденного файла
         try:
-            bad_path = SETTINGS_PATH + ".bad"
+            bad_path = f"{SETTINGS_PATH}.{int(time.time())}.bad"
             shutil.copy2(SETTINGS_PATH, bad_path)
             log_error("_load_settings", Exception(f"Копия поврежденного файла сохранена в {bad_path}"))
         except Exception:
@@ -4603,16 +4603,14 @@ def _ensure_ohm_running():
         task_name = "Optix_OHM_Hidden"
         
         # 2. Проверяем, есть ли задача в Планировщике. Если нет — создаем (один раз).
-        r = subprocess.run(["schtasks", "/query", "/tn", task_name], capture_output=True, creationflags=CREATE_NO_WINDOW)
+        r = subprocess.run(["schtasks", "/query", "/tn", task_name], capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW)
         if r.returncode != 0:
-            # Задачи нет — создаем её
-            cmd_create = ["schtasks", "/create", "/tn", task_name, 
-                          "/tr", f'"{exe}" -minimized', 
-                          "/sc", "once", "/st", "00:00", "/ru", "SYSTEM", "/f"]
-            subprocess.run(cmd_create, capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW)
-        
-        # 3. Запускаем задачу (теперь это происходит мгновенно)
-        r_run = subprocess.run(["schtasks", "/run", "/tn", task_name], capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+            # Задачи нет — создаем её (только если есть права админа)
+            if is_admin():
+                cmd_create = ["schtasks", "/create", "/tn", task_name, 
+                              "/tr", f'"{exe}" -minimized', 
+                              "/sc", "once", "/st", "00:00", "/ru", "SYSTEM", "/f"]
+                subprocess.run(cmd_create, capture_output=True, timeout=10, creationflags=CREATE_NO_WINDOW)
         
         if r_run.returncode != 0:
             # Если не удалось запустить от SYSTEM (например, нет прав), 
@@ -4790,68 +4788,78 @@ def _get_temperatures():
     temps = {"cpu": None, "gpu": None}
 
     # ─── Инициализация COM для текущего потока ───
-    # Без этого wmi.WMI() из фонового threading.Thread молча падает,
-    # потому что каждый поток должен сам инициализировать COM.
+    com_initialized = False
     try:
         import pythoncom
         pythoncom.CoInitialize()
+        com_initialized = True
     except Exception:
         pass
 
-    if not WMI_AVAILABLE:
-        try:
-            nv = _get_gpu_temp_nvidia()
-            if nv is not None:
-                temps["gpu"] = nv
-        except Exception:
-            pass
-        return temps
-
     try:
-        w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
-        cpu_candidates = []
-        gpu_candidates = []
-        for s in w.Sensor():
-            if s.SensorType != "Temperature":
-                continue
-            name = (s.Name or "").lower()
-            parent = (getattr(s, "Parent", "") or "").lower()
-            hay = name + " " + parent
-            val = s.Value
-            if val is None:
-                continue
-            if any(k in hay for k in ["cpu", "core", "package", "pkg",
-                                       "intel", "amd", "ryzen", "core i"]):
-                cpu_candidates.append(val)
-            elif any(k in hay for k in ["gpu", "nvidia", "geforce", "radeon",
-                                         "amd gpu", "intel gpu"]):
-                gpu_candidates.append(val)
-        if cpu_candidates:
-            temps["cpu"] = round(max(cpu_candidates), 1)
-        if gpu_candidates:
-            temps["gpu"] = round(max(gpu_candidates), 1)
-    except Exception as e:
-        log_error("_get_temperatures_ohm", e)
+        if not WMI_AVAILABLE:
+            try:
+                nv = _get_gpu_temp_nvidia()
+                if nv is not None:
+                    temps["gpu"] = nv
+            except Exception:
+                pass
+            return temps
 
-    if temps["cpu"] is None:
         try:
-            w = wmi.WMI(namespace="root\\WMI")
-            for zone in w.MSAcpi_ThermalZoneTemperature():
-                c = (zone.CurrentTemperature / 10.0) - 273.15
-                if 0 < c < 150:
-                    temps["cpu"] = round(c, 1)
-                    break
+            w = wmi.WMI(namespace="root\\OpenHardwareMonitor")
+            cpu_candidates = []
+            gpu_candidates = []
+            for s in w.Sensor():
+                if s.SensorType != "Temperature":
+                    continue
+                name = (s.Name or "").lower()
+                parent = (getattr(s, "Parent", "") or "").lower()
+                hay = name + " " + parent
+                val = s.Value
+                if val is None:
+                    continue
+                if any(k in hay for k in ["cpu", "core", "package", "pkg",
+                                           "intel", "amd", "ryzen", "core i"]):
+                    cpu_candidates.append(val)
+                elif any(k in hay for k in ["gpu", "nvidia", "geforce", "radeon",
+                                             "amd gpu", "intel gpu"]):
+                    gpu_candidates.append(val)
+            if cpu_candidates:
+                temps["cpu"] = round(max(cpu_candidates), 1)
+            if gpu_candidates:
+                temps["gpu"] = round(max(gpu_candidates), 1)
         except Exception as e:
-            log_error("_get_temperatures_acpi", e)
+            log_error("_get_temperatures_ohm", e)
 
-    # ─── nvidia-smi — если OHM и WMI не дали температуру GPU ───
-    if temps["gpu"] is None:
-        try:
-            nv = _get_gpu_temp_nvidia()
-            if nv is not None:
-                temps["gpu"] = nv
-        except Exception:
-            pass
+        if temps["cpu"] is None:
+            try:
+                w = wmi.WMI(namespace="root\\WMI")
+                for zone in w.MSAcpi_ThermalZoneTemperature():
+                    c = (zone.CurrentTemperature / 10.0) - 273.15
+                    if 0 < c < 150:
+                        temps["cpu"] = round(c, 1)
+                        break
+            except Exception as e:
+                log_error("_get_temperatures_acpi", e)
+
+        # ─── nvidia-smi — если OHM и WMI не дали температуру GPU ───
+        if temps["gpu"] is None:
+            try:
+                nv = _get_gpu_temp_nvidia()
+                if nv is not None:
+                    temps["gpu"] = nv
+            except Exception:
+                pass
+
+        return temps
+    finally:
+        if com_initialized:
+            try:
+                import pythoncom
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
 
     return temps
 
@@ -5004,6 +5012,9 @@ def _get_vram_from_registry(gpu_name):
 def _get_top_processes(n=5):
     try:
         import psutil
+        # Принудительный первый вызов, чтобы заполнить счетчики CPU
+        psutil.cpu_percent(percpu=False)
+        
         # Исключаем "мусорные" — Idle и System
         SKIP = {"System Idle Process", "Idle", "System"}
         procs = []
@@ -5323,8 +5334,9 @@ def _monitor_update_loop():
         log_error("monitor_loop_tops", e)
 
     # Увеличили интервал до 3 сек, чтобы снизить нагрузку от psutil
-    # Запускаем сбор данных в фоне
-    threading.Thread(target=_monitor_collect_bg, daemon=True).start()
+    # Запускаем сбор данных в фоне только если мониторинг активен
+    if _monitor_state.get("active"):
+        threading.Thread(target=_monitor_collect_bg, daemon=True).start()
     app.after(3000, _monitor_update_loop)
 
 
@@ -6768,19 +6780,22 @@ def _net_adapters_update():
             pass
 
     try:
-        win.after(1000, _net_adapters_update)
+        _net_adapters_state["after_id"] = win.after(1000, _net_adapters_update)
     except Exception:
         st["active"] = False
 
 
 def _close_net_adapters(win):
     _net_adapters_state["active"] = False
+    if "after_id" in _net_adapters_state and _net_adapters_state["after_id"]:
+        try: win.after_cancel(_net_adapters_state["after_id"])
+        except Exception: pass
+        _net_adapters_state["after_id"] = None
     _net_adapters_state["window"] = None
     try:
         win.destroy()
     except Exception:
         pass
-
 
 def open_net_adapters_window():
     """Окно мониторинга трафика по адаптерам."""
@@ -6942,7 +6957,7 @@ def open_net_adapters_window():
         _close_net_adapters(win)
     win.protocol("WM_DELETE_WINDOW", _on_close)
 
-    win.after(200, _net_adapters_update)
+    _net_adapters_state["after_id"] = win.after(200, _net_adapters_update)
 
 
 def build_monitor_page(parent):
@@ -21903,7 +21918,7 @@ def load_bench_history():
     except Exception as e:
         log_error("load_bench_history: файл поврежден", e)
         try:
-            bad_path = BENCH_PATH + ".bad"
+            bad_path = f"{BENCH_PATH}.{int(time.time())}.bad"
             shutil.copy2(BENCH_PATH, bad_path)
             log_error("load_bench_history", Exception(f"Копия сохранена в {bad_path}"))
         except Exception:
@@ -21920,16 +21935,18 @@ def save_bench_history(history):
 
 
 def run_benchmark(profile_key="full"):
-    if bench_running["active"]:
-        return
-    bench_running["active"] = True
-
+    # Флаг уже установлен в _start_bench_profile_with_pulse
     profile = BENCH_PROFILES.get(profile_key, BENCH_PROFILES["full"])
     test_keys = profile["tests"]
 
-    bench_ui["status"].configure(text="⏳ Запуск...", text_color="#FFD54F")
-    for w in bench_ui["results_frame"].winfo_children():
-        w.destroy()
+    def _bench_reset_ui():
+        try:
+            bench_ui["status"].configure(text="⏳ Запуск...", text_color="#FFD54F")
+            for w in bench_ui["results_frame"].winfo_children():
+                w.destroy()
+        except Exception:
+            pass
+    app.after(0, _bench_reset_ui)
 
     results = {}
     total_tests = len(test_keys)
@@ -21975,13 +21992,18 @@ def run_benchmark(profile_key="full"):
     h.append(entry)
     save_bench_history(h[-30:])
 
-    app.after(0, lambda: render_bench_results(entry))
-    app.after(0, lambda: bench_ui["status"].configure(
-        text=f"✅ Готово • Оценка: {total_score}", text_color="#7CFC7C"))
-    bench_ui["progress"].set(0)
-    bench_running["active"] = False
-    app.after(0, lambda: bench_ui["start_btn"].configure(
-        state="normal", text="▶ ЗАПУСТИТЬ"))
+    def _bench_finish_ui():
+        try:
+            render_bench_results(entry)
+            bench_ui["status"].configure(
+                text=f"✅ Готово • Оценка: {total_score}", text_color="#7CFC7C")
+            bench_ui["progress"].set(0)
+            bench_ui["start_btn"].configure(
+                state="normal", text="▶ ЗАПУСТИТЬ")
+        except Exception:
+            pass
+        bench_running["active"] = False
+    app.after(0, _bench_finish_ui)
 
 
 def render_bench_results(entry):
@@ -22380,6 +22402,9 @@ def build_benchmark_page(parent):
 
 def _start_bench_profile_with_pulse(btn):
     """Запускает бенчмарк с пульсацией кнопки."""
+    if bench_running["active"]:
+        return
+    bench_running["active"] = True
     key = bench_ui.get("active_profile", "full")
     
     _start_button_pulse(btn, "#2E7D32", "#43A047")
@@ -23400,7 +23425,15 @@ def _driver_ensure_restore_point():
                 ts_ms = int(m.group(1))
                 dt = datetime.fromtimestamp(ts_ms / 1000)
             else:
-                dt = datetime.strptime(last[:19], "%Y-%m-%d %H:%M:%S")
+                dt = None
+                for fmt in ("%Y-%m-%d %H:%M:%S", "%d.%m.%Y %H:%M:%S", "%m/%d/%Y %H:%M:%S"):
+                    try:
+                        dt = datetime.strptime(last[:19], fmt)
+                        break
+                    except ValueError:
+                        continue
+                if dt is None:
+                    raise ValueError("Не удалось распарсить дату")
             age_hours = (datetime.now() - dt).total_seconds() / 3600
             if age_hours > 24:
                 need_create = True
@@ -25797,7 +25830,7 @@ def load_optix_tasks():
     except Exception as e:
         log_error("load_optix_tasks: файл поврежден", e)
         try:
-            bad_path = OPTIX_TASKS_PATH + ".bad"
+            bad_path = f"{OPTIX_TASKS_PATH}.{int(time.time())}.bad"
             shutil.copy2(OPTIX_TASKS_PATH, bad_path)
             log_error("load_optix_tasks", Exception(f"Копия сохранена в {bad_path}"))
         except Exception:
@@ -29084,7 +29117,13 @@ def open_diagnostics_report():
             except Exception:
                 pass
             app.after(0, dlg.destroy)
-            app.after(100, lambda: os.startfile(path))
+            def _safe_open():
+                try:
+                    if os.path.exists(path):
+                        os.startfile(path)
+                except Exception:
+                    pass
+            app.after(100, _safe_open)
 
         app.after(0, finish)
 
@@ -32307,7 +32346,7 @@ def load_clean_profiles():
     except Exception as e:
         log_error("load_clean_profiles: файл поврежден", e)
         try:
-            bad_path = PROFILES_PATH + ".bad"
+            bad_path = f"{PROFILES_PATH}.{int(time.time())}.bad"
             shutil.copy2(PROFILES_PATH, bad_path)
             log_error("load_clean_profiles", Exception(f"Копия сохранена в {bad_path}"))
         except Exception:
@@ -32639,6 +32678,9 @@ _dashboard_state = {
 }
 
 
+_anim_state = {}  # Глобальный реестр активных анимаций
+
+
 def _ease_out(t):
     """Функция плавности (ускорение в начале, замедление в конце)."""
     return 1 - (1 - t) ** 3
@@ -32648,11 +32690,17 @@ def _animate_value(label, start, end, color, duration=600, suffix="", decimals=0
     """Плавная анимация числового значения (count-up)."""
     if not label or not label.winfo_exists():
         return
+    key = id(label)
+    prev = _anim_state.get(key)
+    if prev:
+        try: app.after_cancel(prev)
+        except Exception: pass
     steps = 24
     step_time = max(15, duration // steps)
     
     def step(i):
         if not label.winfo_exists():
+            _anim_state.pop(key, None)
             return
         t = _ease_out(i / steps)
         current = start + (end - start) * t
@@ -32663,9 +32711,12 @@ def _animate_value(label, start, end, color, duration=600, suffix="", decimals=0
                 text = f"{int(round(current))}{suffix}"
             label.configure(text=text, text_color=color)
         except Exception:
+            _anim_state.pop(key, None)
             return
         if i < steps:
-            app.after(step_time, step, i+1)
+            _anim_state[key] = app.after(step_time, step, i+1)
+        else:
+            _anim_state.pop(key, None)
     
     step(0)
 
@@ -32674,20 +32725,29 @@ def _animate_bar(bar, start, end, duration=600):
     """Плавная анимация прогресс-бара."""
     if not bar or not bar.winfo_exists():
         return
+    key = id(bar)
+    prev = _anim_state.get(key)
+    if prev:
+        try: app.after_cancel(prev)
+        except Exception: pass
     steps = 24
     step_time = max(15, duration // steps)
     
     def step(i):
         if not bar.winfo_exists():
+            _anim_state.pop(key, None)
             return
         t = _ease_out(i / steps)
         current = start + (end - start) * t
         try:
             bar.set(max(0.0, min(1.0, current)))
         except Exception:
+            _anim_state.pop(key, None)
             return
         if i < steps:
-            app.after(step_time, step, i+1)
+            _anim_state[key] = app.after(step_time, step, i+1)
+        else:
+            _anim_state.pop(key, None)
     
     step(0)
 
@@ -34600,6 +34660,8 @@ def _on_window_close():
         # Смотрим на настройку
         if _STATE.get("minimize_to_tray", True):
             # Сворачиваем в трей
+            _monitor_state["active"] = False
+            _dashboard_state["active"] = False
             app.withdraw()
             if not _STATE.get("tray_hint_shown", False):
                 try:
@@ -34635,6 +34697,16 @@ def _do_show_window():
         app.deiconify()
         app.lift()
         app.focus_force()
+        
+        # Возобновляем циклы, если открыты нужные страницы
+        if "monitor" in page_frames and page_frames["monitor"].winfo_ismapped():
+            if not _monitor_state["active"]:
+                _monitor_state["active"] = True
+                _monitor_update_loop()
+        if "dashboard" in page_frames and page_frames["dashboard"].winfo_ismapped():
+            if not _dashboard_state["active"]:
+                _dashboard_state["active"] = True
+                _update_dashboard()
     except Exception:
         pass
 
@@ -34689,6 +34761,12 @@ try:
     start_temp_history_worker()
 except Exception as _e:
     log_error("start_temp_history_worker", _e)
+
+# Предзапуск сборщиков данных, чтобы на UI не было пустых значений
+try:
+    threading.Thread(target=_monitor_collect_bg, daemon=True).start()
+except Exception as _e:
+    log_error("startup_monitor_collect", _e)
 
 # Фоновый кэш температур для UI (чтобы не грузить главный поток)
 try:
