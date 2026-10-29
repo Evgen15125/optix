@@ -50,7 +50,7 @@ SETTINGS_PATH = os.path.join(BASE_DIR, "optix_settings.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backup_deleted")
 SCHEDULER_TASK_NAME = "Optix_Scheduler"
 CREATE_NO_WINDOW = 0x08000000
-APP_VERSION = "1.8.3"
+APP_VERSION = "1.8.5"
 
 # ⬆ GitHub-репозиторий для проверки обновлений.
 # Формат: "username/repo" (без https://github.com/)
@@ -755,7 +755,9 @@ def _safe_startfile(path):
     """Безопасно открывает файл или папку в проводнике."""
     try:
         if os.path.exists(path):
-            _safe_startfile(path)
+            os.startfile(path)  # ← Восстановлен родной вызов Windows
+        else:
+            log_error(f"_safe_startfile({path})", FileNotFoundError(path))
     except Exception as e:
         log_error(f"_safe_startfile({path})", e)
 
@@ -4546,6 +4548,7 @@ except Exception:
 
 _monitor_state = {
     "active": False,
+    "user_active": False,
     "history_cpu": [],
     "history_ram": [],
     "history_temp_cpu": [],
@@ -4665,13 +4668,23 @@ def _ensure_ohm_running():
                 
         _OHM_STARTED_BY_US["value"] = True
         if run_ok:
-            # Пытаемся получить PID процесса, запущенного через задачу
+            # Ждём появления процесса: schtasks /run выполняется асинхронно
             try:
                 import psutil
-                for proc in psutil.process_iter(['pid', 'name']):
-                    if (proc.info['name'] or '').lower() == 'openhardwaremonitor.exe':
-                        _OHM_STARTED_BY_US["pid"] = proc.info['pid']
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    found = None
+                    for proc in psutil.process_iter(['pid', 'name']):
+                        try:
+                            if (proc.info['name'] or '').lower() == 'openhardwaremonitor.exe':
+                                found = proc.info['pid']
+                                break
+                        except Exception:
+                            continue
+                    if found:
+                        _OHM_STARTED_BY_US["pid"] = found
                         break
+                    time.sleep(0.3)
             except Exception:
                 pass
         else:
@@ -5055,6 +5068,34 @@ def _get_vram_from_registry(gpu_name):
     return 0
 
 
+def _get_system_extended():
+    info = {}
+    if not WMI_AVAILABLE:
+        return info
+    try:
+        import pythoncom
+        pythoncom.CoInitialize()
+        w = wmi.WMI()
+        for b in w.Win32_BaseBoard():
+            info["motherboard"] = f"{b.Manufacturer} {b.Product}"
+            break
+        for bios in w.Win32_BIOS():
+            info["bios"] = f"{bios.Manufacturer} {bios.SMBIOSBIOSVersion}"
+            break
+        for cs in w.Win32_ComputerSystem():
+            info["manufacturer"] = cs.Manufacturer
+            info["model"] = cs.Model
+            break
+    except Exception as e:
+        log_error("_get_system_extended", e)
+    finally:
+        try:
+            import pythoncom
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+    return info
+
 def _get_top_processes(n=5):
     try:
         import psutil
@@ -5085,14 +5126,22 @@ def _get_top_processes(n=5):
 
 
 def _export_monitor_report():
+    threading.Thread(target=_export_monitor_report_bg, daemon=True).start()
+
+
+def _export_monitor_report_bg():
     try:
         import psutil
         lines = ["=" * 60, "  ОТЧЁТ МОНИТОРИНГА Optix", "=" * 60, ""]
         lines.append(f"Дата: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         lines.append("")
         cpu = psutil.cpu_percent(interval=None)
-        freq = psutil.cpu_freq()
-        lines.append(f"CPU: {cpu:.1f}%  |  Частота: {freq.current:.0f} МГц")
+        try:
+            freq = psutil.cpu_freq()
+            freq_txt = f"{freq.current:.0f} МГц" if freq else "—"
+        except Exception:
+            freq_txt = "—"
+        lines.append(f"CPU: {cpu:.1f}%  |  Частота: {freq_txt}")
         temps = get_cached_temperatures()
         if temps["cpu"]:
             lines.append(f"  Температура CPU: {temps['cpu']} °C")
@@ -5125,10 +5174,10 @@ def _export_monitor_report():
                             f"monitor_report_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt")
         with open(path, "w", encoding="utf-8-sig") as f:
             f.write("\n".join(lines))
-        messagebox.showinfo("Готово", f"Отчёт сохранён:\n{path}")
-        _safe_startfile(os.path.dirname(path))
+        app.after(0, lambda p=path: messagebox.showinfo("Готово", f"Отчёт сохранён:\n{p}"))
+        app.after(0, lambda p=path: _safe_startfile(os.path.dirname(p)))
     except Exception as e:
-        messagebox.showerror("Ошибка", str(e))
+        app.after(0, lambda err=e: messagebox.showerror("Ошибка", str(err)))
 
 
 def _draw_graph(canvas, data, color, max_val=100, min_val=0, warn_line=None, unit=""):
@@ -32246,9 +32295,11 @@ def _open_disk_management():
         return
     except Exception:
         pass
-    # Способ 2: через os.startfile (ассоциация .msc)
+    # Способ 2: полное расположение оснастки (для _safe_startfile нужен абсолютный путь)
     try:
-        _safe_startfile("diskmgmt.msc")
+        msc = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                           "System32", "diskmgmt.msc")
+        _safe_startfile(msc)
         return
     except Exception:
         pass
@@ -34714,6 +34765,8 @@ def _do_show_window():
         # Возобновляем мониторинг, если он был запущен пользователем
         if _monitor_state.get("user_active", False) and not _monitor_state["active"]:
             _monitor_state["active"] = True
+            # OHM мог умереть, пока окно было свёрнуто — поднимаем в фоне
+            threading.Thread(target=_ensure_ohm_running, daemon=True).start()
             _monitor_update_loop()
             
         # Возобновляем дашборд
