@@ -50,7 +50,7 @@ SETTINGS_PATH = os.path.join(BASE_DIR, "optix_settings.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backup_deleted")
 SCHEDULER_TASK_NAME = "Optix_Scheduler"
 CREATE_NO_WINDOW = 0x08000000
-APP_VERSION = "1.8.5"
+APP_VERSION = "1.8.6"
 
 # ⬆ GitHub-репозиторий для проверки обновлений.
 # Формат: "username/repo" (без https://github.com/)
@@ -4613,9 +4613,14 @@ def _find_ohm_exe():
 
 
 _OHM_STARTED_BY_US = {"value": False, "pid": None}
+_OHM_ENSURE_LOCK = threading.Lock()  # Защита от одновременного запуска OHM
 
 
 def _ensure_ohm_running():
+    # Защита от параллельных вызовов (быстрое сворачивание/разворачивание)
+    if not _OHM_ENSURE_LOCK.acquire(blocking=False):
+        return True  # Если уже запускается другим потоком — выходим
+    
     try:
         import psutil
         # 1. Уже запущен?
@@ -4693,6 +4698,8 @@ def _ensure_ohm_running():
     except Exception as e:
         log_error("_ensure_ohm_running", e)
         return False
+    finally:
+        _OHM_ENSURE_LOCK.release()
 
 
 def _kill_ohm():
@@ -5171,7 +5178,7 @@ def _export_monitor_report_bg():
         lines.append("")
         lines.append("=" * 60)
         path = os.path.join(BASE_DIR,
-                            f"monitor_report_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.txt")
+                            f"monitor_report_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.txt")
         with open(path, "w", encoding="utf-8-sig") as f:
             f.write("\n".join(lines))
         app.after(0, lambda p=path: messagebox.showinfo("Готово", f"Отчёт сохранён:\n{p}"))
@@ -34773,8 +34780,8 @@ def _do_show_window():
         if not _dashboard_state["active"]:
             _dashboard_state["active"] = True
             _update_dashboard()
-    except Exception:
-        pass
+    except Exception as e:
+        log_error("_do_show_window", e)
 
 
 def _on_tray_quick_clean():
